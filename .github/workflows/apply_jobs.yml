@@ -1,0 +1,38 @@
+# ============================================================
+#  Job Application Bot — Auto-Deploy to Fly.io
+# ============================================================
+#  Deploys the always-on bot container to Fly.io whenever
+#  you push to main. The bot then runs continuously, applying
+#  to jobs every 10 minutes around the clock.
+#
+#  Secrets required (add in repo Settings → Secrets):
+#    FLY_API_TOKEN          — from `fly tokens create deploy`
+# ============================================================
+
+name: Deploy Job Application Bot to Fly.io
+
+on:
+  push:
+    branches: [main]
+
+  # Allow manual re-deploy from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout the repo ──────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Deploy to Fly.io ───────────────────────────────
+      - name: Deploy to Fly.io
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Fly Deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

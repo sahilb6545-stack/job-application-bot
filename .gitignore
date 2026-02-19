@@ -1,0 +1,26 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Browser data
+browser_data/
+*.cookies
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs (keep CSV, ignore verbose logs)
+*.log
+
+# PDFs — include the resume, exclude others
+*.pdf
+!Sahil_Bhatt_Resume.pdf

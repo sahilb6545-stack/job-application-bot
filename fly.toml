@@ -1,0 +1,25 @@
+# ── Fly.io configuration ─────────────────────────────────────
+# Deploy with:  fly launch  →  fly deploy
+# Set secrets:  fly secrets set KEY=VALUE ...
+
+app = 'job-application-bot'
+primary_region = 'yyz'          # Toronto (closest to you)
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'    # Keep running 24/7
+  auto_start_machines = true
+  min_machines_running = 1      # Always-on
+
+  [http_service.concurrency]
+    type = 'connections'
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory = '512mb'              # Enough for Chromium headless
+  cpu_kind = 'shared'
+  cpus = 1
