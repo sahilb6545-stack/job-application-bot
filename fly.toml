@@ -1,18 +1,19 @@
-# ── Fly.io configuration ─────────────────────────────────────
-# Deploy with:  fly launch  →  fly deploy
-# Set secrets:  fly secrets set KEY=VALUE ...
+# fly.toml app configuration file generated for job-application-bot on 2026-02-19T18:20:40-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = 'job-application-bot'
-primary_region = 'yyz'          # Toronto (closest to you)
+primary_region = 'yyz'
 
 [build]
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'off'    # Keep running 24/7
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 1      # Always-on
+  min_machines_running = 1
 
   [http_service.concurrency]
     type = 'connections'
@@ -20,6 +21,6 @@ primary_region = 'yyz'          # Toronto (closest to you)
     soft_limit = 20
 
 [[vm]]
-  memory = '512mb'              # Enough for Chromium headless
+  memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1

@@ -12,11 +12,15 @@ Uses Playwright to:
 import logging
 import os
 import re
+import tempfile
+import urllib.request
+from pathlib import Path
 from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 
 from bot.config import (
     LINKEDIN_EMAIL,
     LINKEDIN_PASSWORD,
+    LINKEDIN_COOKIE,
     RESUME_PATH,
     MAX_APPLICATIONS_PER_RUN,
 )
@@ -38,6 +42,30 @@ from bot.utils import human_delay, random_delay, safe_click, safe_fill, safe_upl
 
 log = logging.getLogger(__name__)
 
+# ── Resume Download ──────────────────────────────────────────
+RESUME_DOWNLOAD_URL = (
+    "https://drive.google.com/uc?export=download&id=1fAyQoXCcSguS2ye1PDGQ_bjNp9EEM7_a"
+)
+
+def _ensure_resume() -> str:
+    """Return path to a local resume PDF, downloading from Google Drive if needed."""
+    if RESUME_PATH.exists():
+        log.info(f"Resume found locally: {RESUME_PATH}")
+        return str(RESUME_PATH)
+    # Download to a temp file that persists for this process
+    dest = Path(tempfile.gettempdir()) / "Sahil_Bhatt_Resume.pdf"
+    if dest.exists() and dest.stat().st_size > 1000:
+        log.info(f"Resume already downloaded: {dest}")
+        return str(dest)
+    log.info(f"Downloading resume from Google Drive...")
+    try:
+        urllib.request.urlretrieve(RESUME_DOWNLOAD_URL, str(dest))
+        log.info(f"Resume downloaded: {dest} ({dest.stat().st_size} bytes)")
+        return str(dest)
+    except Exception as e:
+        log.error(f"Failed to download resume: {e}")
+        return str(RESUME_PATH)  # fallback
+
 LINKEDIN_LOGIN_URL = "https://www.linkedin.com/login"
 LINKEDIN_JOBS_URL = "https://www.linkedin.com/jobs/search/"
 
@@ -53,70 +81,349 @@ def _build_search_url(keywords: str, location: str, easy_apply: bool = True) -> 
     return f"{LINKEDIN_JOBS_URL}?{params}"
 
 
-def _login(page: Page):
-    """Log in to LinkedIn."""
-    log.info("Logging in to LinkedIn...")
+def _login(page: Page, context: BrowserContext):
+    """Log in to LinkedIn using cookie (preferred) or username/password."""
+
+    # ── Method 1: Cookie-based auth (bypasses all challenges) ──
+    if LINKEDIN_COOKIE:
+        log.info("Logging in to LinkedIn via li_at cookie...")
+        context.add_cookies([{
+            "name": "li_at",
+            "value": LINKEDIN_COOKIE,
+            "domain": ".www.linkedin.com",
+            "path": "/",
+        }])
+        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        human_delay(2.0)
+
+        url = page.url
+        if any(path in url for path in ["/feed", "/jobs", "/mynetwork", "/messaging", "/in/"]):
+            log.info("LinkedIn cookie login successful.")
+            return
+        else:
+            log.warning(f"Cookie login redirected to {url} — cookie may be expired.")
+            if LINKEDIN_EMAIL and LINKEDIN_PASSWORD:
+                log.info("Falling back to username/password login...")
+            else:
+                raise Exception("LinkedIn cookie expired and no username/password configured.")
+
+    # ── Method 2: Username/password (fallback) ────────────────
+    if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD:
+        raise Exception("No LinkedIn credentials configured (need LINKEDIN_COOKIE or EMAIL+PASSWORD).")
+
+    log.info("Logging in to LinkedIn via username/password...")
     page.goto(LINKEDIN_LOGIN_URL, wait_until="domcontentloaded")
-    human_delay(0.5)
+    human_delay(1.0)
 
     page.fill('input#username', LINKEDIN_EMAIL)
-    human_delay(0.3)
+    human_delay(0.5)
     page.fill('input#password', LINKEDIN_PASSWORD)
-    human_delay(0.3)
+    human_delay(0.5)
     page.click('button[type="submit"]')
 
-    # Wait for navigation to complete
-    page.wait_for_url("**/feed/**", timeout=30000)
-    log.info("LinkedIn login successful.")
-    human_delay(1.0)
+    # Wait for navigation — LinkedIn may redirect to /feed/, /jobs/, /check/, etc.
+    for _ in range(60):  # poll for up to 60 seconds
+        human_delay(0.5)
+        url = page.url
+        log.info(f"Post-login URL: {url}")
+
+        # Success — we're past the login page
+        if any(path in url for path in ["/feed", "/jobs", "/mynetwork", "/messaging", "/in/"]):
+            log.info("LinkedIn login successful.")
+            human_delay(1.0)
+            return
+
+        # Security checkpoint
+        if any(path in url for path in ["/checkpoint", "/challenge", "/authwall"]):
+            log.warning(f"LinkedIn security challenge detected: {url}")
+            log.warning("Set LINKEDIN_COOKIE instead. See logs for instructions.")
+            raise Exception(f"LinkedIn security challenge at: {url}")
+
+        # Still on login page
+        if "/login" in url or "/uas/login" in url:
+            error_el = page.locator('#error-for-password, .form__label--error, [data-error]').first
+            if error_el.is_visible(timeout=1000):
+                error_text = error_el.inner_text(timeout=1000)
+                raise Exception(f"LinkedIn login failed — bad credentials: {error_text}")
+            continue
+
+    raise Exception("LinkedIn login timed out — never reached a logged-in page.")
 
 
 def _get_job_cards(page: Page) -> list[dict]:
-    """Extract visible job cards from the search results page."""
+    """Extract visible job cards from the search results page.
+    Uses multiple fallback strategies including a JS-based generic extractor."""
     jobs = []
-    try:
-        # Wait for job cards to appear
-        page.wait_for_selector(
-            '.jobs-search-results__list-item, .job-card-container',
-            timeout=10000,
-        )
-    except Exception:
-        log.warning("No job cards found on page.")
-        return jobs
 
-    cards = page.locator('.jobs-search-results__list-item, .job-card-container').all()
+    log.info(f"Search results URL: {page.url}")
+
+    # ── Scroll the results pane aggressively to trigger lazy loading ──
+    for scroll_pass in range(3):
+        try:
+            page.evaluate("""
+                (() => {
+                    const containers = document.querySelectorAll(
+                        '.jobs-search-results-list, .scaffold-layout__list, ' +
+                        '.scaffold-layout__list-container, [role="list"], ' +
+                        '.jobs-search-results, .scaffold-layout__list-detail-inner'
+                    );
+                    for (const c of containers) { c.scrollTop += 800; }
+                    window.scrollBy(0, 600);
+                })()
+            """)
+            human_delay(0.8)
+        except Exception:
+            pass
+
+    # ── Strategy 1: CSS selector-based card extraction ──
+    CARD_SELECTORS = [
+        # 2025-2026 LinkedIn selectors (most current first)
+        'li.scaffold-layout__list-item',
+        'li[data-occludable-job-id]',
+        'div[data-job-id]',
+        'li.ember-view.occludable-update',
+        'div.job-card-container',
+        'div.job-card-container--clickable',
+        '.jobs-search-results__list-item',
+        '.job-card-list',
+        'ul.scaffold-layout__list-container > li',
+        '.jobs-search-two-pane__results-list > li',
+        'li.jobs-search-results__list-item',
+        # Generic fallbacks
+        'main ul > li[class*="job"]',
+        'main ul > li[class*="card"]',
+        'div[class*="job-card"]',
+        'div[class*="jobCard"]',
+        'li[class*="result"]',
+        '[data-view-name="job-card"]',
+        'main ul[role="list"] > li',
+        'main div[role="list"] > div',
+    ]
+
+    cards = []
+    winning_selector = ""
+    for selector in CARD_SELECTORS:
+        try:
+            page.wait_for_selector(selector, timeout=3000)
+            found = page.locator(selector).all()
+            if found and len(found) >= 1:
+                log.info(f"Found {len(found)} cards via selector: {selector}")
+                cards = found
+                winning_selector = selector
+                break
+        except Exception:
+            continue
+
+    # ── Strategy 2: JavaScript-based generic extraction ──
+    if not cards:
+        log.info("CSS selectors failed. Trying JS-based job card extraction...")
+        try:
+            js_jobs = page.evaluate("""
+                (() => {
+                    const results = [];
+                    // Find all links to /jobs/view/
+                    const links = document.querySelectorAll('a[href*="/jobs/view/"]');
+                    const seen = new Set();
+                    for (const link of links) {
+                        const href = link.href || link.getAttribute('href') || '';
+                        const m = href.match(/\/jobs\/view\/(\d+)/);
+                        if (!m) continue;
+                        const jobId = m[1];
+                        if (seen.has(jobId)) continue;
+                        seen.add(jobId);
+                        // Walk up to find the card container (li or div parent)
+                        let card = link.closest('li') || link.closest('div[class*="card"]') || link.parentElement;
+                        const title = link.innerText.trim() || '';
+                        // Try to get company and location from siblings/nearby text
+                        let company = '';
+                        let location = '';
+                        if (card) {
+                            const spans = card.querySelectorAll('span, div.artdeco-entity-lockup__subtitle, div[class*="company"], div[class*="primary-description"]');
+                            for (const span of spans) {
+                                const t = span.innerText.trim();
+                                if (!t || t === title) continue;
+                                if (!company && t.length > 1 && t.length < 100 && !t.includes('Easy Apply') && !t.includes('Promoted')) {
+                                    company = t;
+                                } else if (!location && company && t.length > 1 && t.length < 100) {
+                                    location = t;
+                                }
+                            }
+                        }
+                        results.push({
+                            title: title,
+                            company: company,
+                            location: location,
+                            url: href.startsWith('http') ? href : 'https://www.linkedin.com' + href,
+                            job_id: jobId
+                        });
+                    }
+                    return results;
+                })()
+            """)
+            if js_jobs:
+                log.info(f"JS extraction found {len(js_jobs)} job listings.")
+                # We still need element handles for clicking, so locate them
+                for jj in js_jobs:
+                    try:
+                        # Find the clickable link element for this job
+                        link_selector = f'a[href*="/jobs/view/{jj["job_id"]}"]'
+                        el = page.locator(link_selector).first
+                        card_el = el.locator('xpath=ancestor::li').first
+                        if card_el.count() == 0:
+                            card_el = el  # fallback to the link itself
+                        jobs.append({
+                            "title": jj["title"],
+                            "company": jj.get("company", "Unknown") or "Unknown",
+                            "location": jj.get("location", ""),
+                            "url": jj["url"],
+                            "job_id": jj["job_id"],
+                            "element": card_el,
+                        })
+                    except Exception as e:
+                        log.debug(f"Couldn't locate element for job {jj['job_id']}: {e}")
+                        continue
+                if jobs:
+                    log.info(f"Parsed {len(jobs)} jobs via JS extraction.")
+                    return jobs
+        except Exception as e:
+            log.warning(f"JS extraction failed: {e}")
+
+    if not cards:
+        # ── Debug: log what's actually on the page ──
+        try:
+            body_text = page.inner_text("body", timeout=5000)[:800]
+            log.warning(f"No job cards found. Page text preview:\n{body_text}")
+        except Exception:
+            pass
+        try:
+            snippet = page.evaluate("""
+                (() => {
+                    const el = document.querySelector(
+                        '.scaffold-layout__list-container, ' +
+                        '.jobs-search-results-list, ' +
+                        'main, [role="main"]'
+                    );
+                    return el ? el.innerHTML.substring(0, 1500) : 'NO_MAIN_ELEMENT';
+                })()
+            """)
+            log.warning(f"Results container HTML:\n{snippet}")
+        except Exception:
+            pass
+        # ── Strategy 3: find ALL <li> under main that contain a /jobs/view link ──
+        try:
+            fallback_cards = page.locator('main li:has(a[href*="/jobs/view/"])').all()
+            if fallback_cards:
+                log.info(f"Fallback: found {len(fallback_cards)} <li> with job links.")
+                cards = fallback_cards
+                winning_selector = 'main li:has(a[href*="/jobs/view/"])'
+            else:
+                log.warning("No job cards found on page after all strategies.")
+                return jobs
+        except Exception:
+            log.warning("No job cards found on page after all strategies.")
+            return jobs
+
+    # ── Parse each card ──
+    TITLE_SELECTORS = [
+        'a.job-card-container__link strong',
+        '.job-card-list__title',
+        '.job-card-container__link',
+        'a[data-control-name="job_card_title"] strong',
+        'a[href*="/jobs/view/"] strong',
+        'a[href*="/jobs/view/"] span',
+        'a[href*="/jobs/view/"]',
+        'a strong',
+        'a span',
+    ]
+    COMPANY_SELECTORS = [
+        '.job-card-container__primary-description',
+        '.job-card-container__company-name',
+        '.artdeco-entity-lockup__subtitle',
+        'span.job-card-container__primary-description',
+        '.artdeco-entity-lockup__subtitle span',
+        'div[class*="company"]',
+        'span[class*="company"]',
+    ]
+    LOCATION_SELECTORS = [
+        '.job-card-container__metadata-wrapper',
+        '.artdeco-entity-lockup__caption',
+        '.job-card-container__metadata-item',
+        'li.job-card-container__metadata-item',
+        'div[class*="metadata"]',
+        'span[class*="location"]',
+        'div[class*="location"]',
+    ]
+
     for card in cards:
         try:
-            title_el = card.locator('.job-card-list__title, .job-card-container__link')
-            title = title_el.inner_text(timeout=3000).strip()
+            # ── Title ──
+            title = ""
+            for s in TITLE_SELECTORS:
+                try:
+                    el = card.locator(s).first
+                    if el.count() > 0:
+                        title = el.inner_text(timeout=2000).strip()
+                        if title:
+                            break
+                except Exception:
+                    continue
+            if not title:
+                try:
+                    title = card.locator("a").first.inner_text(timeout=2000).strip()
+                except Exception:
+                    continue
 
-            company_el = card.locator(
-                '.job-card-container__primary-description, '
-                '.job-card-container__company-name, '
-                '.artdeco-entity-lockup__subtitle'
-            )
-            company = company_el.inner_text(timeout=3000).strip()
+            # ── Company ──
+            company = ""
+            for s in COMPANY_SELECTORS:
+                try:
+                    el = card.locator(s).first
+                    if el.count() > 0:
+                        company = el.inner_text(timeout=2000).strip()
+                        if company:
+                            break
+                except Exception:
+                    continue
 
-            location_el = card.locator(
-                '.job-card-container__metadata-wrapper, '
-                '.artdeco-entity-lockup__caption'
-            )
-            location = location_el.inner_text(timeout=3000).strip()
+            # ── Location ──
+            location = ""
+            for s in LOCATION_SELECTORS:
+                try:
+                    el = card.locator(s).first
+                    if el.count() > 0:
+                        location = el.inner_text(timeout=2000).strip()
+                        if location:
+                            break
+                except Exception:
+                    continue
 
-            # Get the job link
-            link_el = card.locator('a').first
-            href = link_el.get_attribute('href') or ""
+            # ── Link / job ID ──
+            href = ""
+            try:
+                link_el = card.locator('a[href*="/jobs/view/"]').first
+                if link_el.count() > 0:
+                    href = link_el.get_attribute("href") or ""
+            except Exception:
+                pass
+            if not href:
+                try:
+                    href = card.locator("a").first.get_attribute("href") or ""
+                except Exception:
+                    pass
             if href and not href.startswith("http"):
                 href = f"https://www.linkedin.com{href}"
 
-            # Extract job ID from URL
-            job_id_match = re.search(r'/jobs/view/(\d+)', href)
-            job_id = job_id_match.group(1) if job_id_match else ""
+            job_id = card.get_attribute("data-occludable-job-id") or ""
+            if not job_id:
+                job_id = card.get_attribute("data-job-id") or ""
+            if not job_id:
+                m = re.search(r"/jobs/view/(\d+)", href)
+                job_id = m.group(1) if m else ""
 
             jobs.append({
                 "title": title,
-                "company": company,
-                "location": location,
+                "company": company or "Unknown",
+                "location": location or "",
                 "url": href,
                 "job_id": job_id,
                 "element": card,
@@ -124,6 +431,8 @@ def _get_job_cards(page: Page) -> list[dict]:
         except Exception as e:
             log.debug(f"Failed to parse a job card: {e}")
             continue
+
+    log.info(f"Parsed {len(jobs)} job listings from page.")
     return jobs
 
 
@@ -147,6 +456,9 @@ def _apply_easy_apply(page: Page, job: dict) -> bool:
     except Exception as e:
         log.warning(f"Easy Apply button not found: {e}")
         return False
+
+    # Ensure resume is available
+    resume_path = _ensure_resume()
 
     # Cap the number of modal pages to prevent infinite loops
     max_pages = 10
@@ -173,14 +485,14 @@ def _apply_easy_apply(page: Page, job: dict) -> bool:
                     'div:has-text("Your application was sent")',
                     timeout=8000,
                 )
-                log.info(f"✓ Successfully applied: {job['company']} — {job['title']}")
+                log.info(f"Applied successfully: {job['company']} — {job['title']}")
                 # Dismiss the success dialog
                 safe_click(page, 'button[aria-label="Dismiss"], button:has-text("Done")', timeout=3000)
                 return True
             except Exception:
                 log.warning("Submit clicked but success confirmation not detected.")
-                # Dismiss any dialog
                 safe_click(page, 'button[aria-label="Dismiss"], button:has-text("Done")', timeout=2000)
+                log.info(f"Applied successfully (optimistic): {job['company']} — {job['title']}")
                 return True  # Optimistic — likely submitted
 
         # ── Check for "Review" button (final review page before submit) ──
@@ -198,11 +510,11 @@ def _apply_easy_apply(page: Page, job: dict) -> bool:
         file_input = page.locator('input[type="file"]').first
         if file_input.count() > 0:
             try:
-                file_input.set_input_files(str(RESUME_PATH))
-                log.info("Resume uploaded.")
+                file_input.set_input_files(resume_path)
+                log.info(f"Resume uploaded from: {resume_path}")
                 human_delay(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"Resume upload failed: {e}")
 
         # ── Click "Next" to advance ──
         next_btn = page.locator(
@@ -371,7 +683,7 @@ def run_linkedin_bot() -> int:
     Run the full LinkedIn Easy Apply flow.
     Returns the number of successful applications.
     """
-    if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD:
+    if not LINKEDIN_COOKIE and not LINKEDIN_EMAIL:
         log.error("LinkedIn credentials not configured. Skipping LinkedIn.")
         return 0
 
@@ -386,6 +698,8 @@ def run_linkedin_bot() -> int:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1280,900",
             ],
         )
         context: BrowserContext = browser.new_context(
@@ -395,11 +709,15 @@ def run_linkedin_bot() -> int:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="America/Toronto",
         )
+        # Remove the webdriver flag so LinkedIn doesn't detect automation
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page: Page = context.new_page()
 
         try:
-            _login(page)
+            _login(page, context)
         except Exception as e:
             log.error(f"LinkedIn login failed: {e}")
             browser.close()
@@ -417,11 +735,35 @@ def run_linkedin_bot() -> int:
                 search_url = _build_search_url(job_title, location)
                 log.info(f"Searching: '{job_title}' in '{location}'")
 
-                try:
-                    page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-                    human_delay(1.5)
-                except Exception as e:
-                    log.warning(f"Failed to load search page: {e}")
+                # Retry logic: up to 3 attempts with 60s timeout
+                search_loaded = False
+                for attempt in range(1, 4):
+                    try:
+                        log.info(f"Loading search page (attempt {attempt}/3)...")
+                        page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                        human_delay(2.5)
+                        # Wait for results to appear
+                        try:
+                            page.wait_for_selector(
+                                'a[href*="/jobs/view/"], .jobs-search-results-list, '
+                                '.scaffold-layout__list-container, main ul',
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass  # proceed anyway — JS extraction may still work
+                        # Scroll to trigger lazy loading
+                        page.evaluate("window.scrollBy(0, 300)")
+                        human_delay(1.0)
+                        search_loaded = True
+                        break
+                    except Exception as e:
+                        log.warning(f"Search page load attempt {attempt}/3 failed: {e}")
+                        if attempt < 3:
+                            human_delay(3.0)
+                        continue
+
+                if not search_loaded:
+                    log.error(f"Failed to load search after 3 attempts: '{job_title}' in '{location}'")
                     continue
 
                 # Scroll through pages of results (up to 3 pages)

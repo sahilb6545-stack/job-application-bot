@@ -20,6 +20,7 @@ APPLICATIONS_CSV = DATA_DIR / "applications.csv"
 # ── LinkedIn ─────────────────────────────────────────────────
 LINKEDIN_EMAIL = os.getenv("LINKEDIN_EMAIL", "")
 LINKEDIN_PASSWORD = os.getenv("LINKEDIN_PASSWORD", "")
+LINKEDIN_COOKIE = os.getenv("LINKEDIN_COOKIE", "")  # li_at session cookie (preferred)
 
 # ── Indeed ───────────────────────────────────────────────────
 INDEED_EMAIL = os.getenv("INDEED_EMAIL", "")
