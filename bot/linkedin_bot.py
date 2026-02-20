@@ -87,13 +87,16 @@ def _login(page: Page, context: BrowserContext):
     # ── Method 1: Cookie-based auth (bypasses all challenges) ──
     if LINKEDIN_COOKIE:
         log.info("Logging in to LinkedIn via li_at cookie...")
-        context.add_cookies([{
-            "name": "li_at",
-            "value": LINKEDIN_COOKIE,
-            "domain": ".www.linkedin.com",
-            "path": "/",
-        }])
-        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        # Set cookie on .linkedin.com (covers www.linkedin.com and all subdomains)
+        context.add_cookies([
+            {
+                "name": "li_at",
+                "value": LINKEDIN_COOKIE,
+                "domain": ".linkedin.com",
+                "path": "/",
+            },
+        ])
+        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=60000)
         human_delay(2.0)
 
         url = page.url
