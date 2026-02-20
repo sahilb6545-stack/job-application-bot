@@ -1,38 +1,38 @@
-# ============================================================
-#  Job Application Bot — Auto-Deploy to Fly.io
-# ============================================================
-#  Deploys the always-on bot container to Fly.io whenever
-#  you push to main. The bot then runs continuously, applying
-#  to jobs every 10 minutes around the clock.
-#
-#  Secrets required (add in repo Settings → Secrets):
-#    FLY_API_TOKEN          — from `fly tokens create deploy`
-# ============================================================
-
-name: Deploy Job Application Bot to Fly.io
-
+name: Job Application Bot
 on:
-  push:
-    branches: [main]
-
-  # Allow manual re-deploy from the Actions tab
+  schedule:
+    - cron: "0 */2 * * *"
   workflow_dispatch:
-
 jobs:
-  deploy:
+  apply:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      # ── 1. Checkout the repo ──────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ── 2. Deploy to Fly.io ───────────────────────────────
-      - name: Deploy to Fly.io
-        uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - name: Fly Deploy
-        run: flyctl deploy --remote-only
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+      - name: Run job application bot
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          LINKEDIN_EMAIL: ${{ secrets.LINKEDIN_EMAIL }}
+          LINKEDIN_PASSWORD: ${{ secrets.LINKEDIN_PASSWORD }}
+          LINKEDIN_COOKIE: ${{ secrets.LINKEDIN_COOKIE }}
+          INDEED_EMAIL: ${{ secrets.INDEED_EMAIL }}
+          INDEED_PASSWORD: ${{ secrets.INDEED_PASSWORD }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          APPLICANT_PHONE: ${{ secrets.APPLICANT_PHONE }}
+        run: python main.py --once
+      - name: Commit application log
+        run: |
+          git config user.email "sahilbhatt3328@gmail.com"
+          git config user.name "Job Bot"
+          git add data/applications.csv || true
+          git commit -m "log: update application records" || true
+          git push || true
