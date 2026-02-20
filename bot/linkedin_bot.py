@@ -115,9 +115,10 @@ def _login(page: Page, context: BrowserContext):
         raise Exception("No LinkedIn credentials configured (need LINKEDIN_COOKIE or EMAIL+PASSWORD).")
 
     log.info("Logging in to LinkedIn via username/password...")
-    page.goto(LINKEDIN_LOGIN_URL, wait_until="domcontentloaded")
+    page.goto(LINKEDIN_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
     human_delay(1.0)
 
+    page.wait_for_selector('input#username', timeout=15000)
     page.fill('input#username', LINKEDIN_EMAIL)
     human_delay(0.5)
     page.fill('input#password', LINKEDIN_PASSWORD)

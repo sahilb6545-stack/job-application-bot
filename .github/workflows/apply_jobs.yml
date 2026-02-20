@@ -3,11 +3,17 @@ on:
   schedule:
     - cron: "0 */2 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   apply:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
